@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Interactive Anki Card Creator using 'trans' (Translate Shell) - English to English
+Interactive Anki Card Creator using 'trans' (Translate Shell) - Multilingual
 """
 
 import sys
@@ -11,6 +11,7 @@ import requests
 import urllib.parse
 import re
 import time
+import base64
 
 ANKI_CONNECT_URL = 'http://localhost:8765'
 MODEL_NAME = 'FF basic vocabulary'
@@ -29,13 +30,20 @@ def invoke(action, **params):
 
 def check_anki_connection():
     try: return requests.get(ANKI_CONNECT_URL).status_code == 200
-    except: return False
+    except Exception: return False
+
+def card_exists(deck, word):
+    safe_word = word.replace('"', '\\"')
+    query = f'deck:"{deck}" "Word:{safe_word}"'
+    res = invoke('findNotes', query=query)
+    return bool(res)
 
 def get_deck_names(): return invoke('deckNames')
 
 def select_deck():
     decks = get_deck_names()
     if not decks: return "Default"
+    decks.sort(reverse=True)
     print("\nAvailable Decks:")
     for i, deck in enumerate(decks, 1): print(f"{i}. {deck}")
     while True:
@@ -44,24 +52,23 @@ def select_deck():
         if choice.isdigit() and 0 < int(choice) <= len(decks): return decks[int(choice)-1]
         print("Invalid selection.")
 
-def run_trans_dump(word):
-    # Force English locale to ensure POS and labels are in English
-    env = os.environ.copy()
-    env["LANG"] = "en_US.UTF-8"
-    cmd = ["trans", "-dump", "-no-ansi", "-s", "en", "-t", "en", word]
+def run_trans_dump(word, lang='en'):
+    # Use the target language for host language (-hl) to get definitions in that language
+    # This ensures "full immersion" definitions.
+    cmd = ["trans", "-dump", "-no-ansi", "-s", lang, "-t", lang, "-hl", lang, word]
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, env=env)
+        result = subprocess.run(cmd, capture_output=True, text=True)
         output = result.stdout.strip()
         start, end = output.find('['), output.rfind(']')
         if start != -1 and end != -1: return json.loads(output[start:end+1])
-    except: pass
+    except Exception: pass
     return None
 
-def download_audio(word):
+def download_audio(word, lang='en'):
     filename = f"anki_audio_{re.sub(r'[^a-zA-Z0-9]', '_', word)}.mp3"
     filepath = os.path.join(TMP_DIR, filename)
-    # -speak downloads the original text audio (English)
-    subprocess.run(["trans", "-download-audio-as", filepath, "-s", "en", "-speak", "-no-ansi", word], 
+    # -speak downloads the original text audio
+    subprocess.run(["trans", "-download-audio-as", filepath, "-s", lang, "-speak", "-no-ansi", word], 
                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     return (filepath, filename) if os.path.exists(filepath) and os.path.getsize(filepath) > 0 else (None, None)
 
@@ -86,15 +93,22 @@ def parse_trans_data(data, word):
                         pos = pos_block[0]
                         entries = pos_block[1]
                         if not isinstance(entries, list): continue
-                        
+
+                        # Collect synonyms for this POS (entries where val is a list)
+                        synonyms = []
+                        for entry in entries:
+                            if isinstance(entry, list) and len(entry) > 0 and isinstance(entry[0], list):
+                                synonyms.extend(entry[0][:3])
+                        syn_suffix = f" | Synonyms: {', '.join(synonyms[:3])}" if synonyms else ""
+
                         for entry in entries:
                             if not isinstance(entry, list) or len(entry) == 0: continue
                             val = entry[0]
-                            
+
                             # Definitions are strings; synonym lists are lists
                             if isinstance(val, str):
                                 all_pos.add(pos)
-                                result["definitions"].append(f"({pos}) {val}")
+                                result["definitions"].append(f"({pos}) {val}{syn_suffix}")
                                 if len(entry) > 2 and isinstance(entry[2], str):
                                     result["examples"].append(entry[2])
 
@@ -118,9 +132,15 @@ def parse_trans_data(data, word):
     return result
 
 def main():
-    if not check_anki_connection(): print("Error: Anki is not running."); sys.exit(1)
+    if not check_anki_connection():
+        subprocess.run(["dunstify", "-u", "critical", "Anki is not running!"])
+        print("Error: Anki is not running.")
+        sys.exit(1)
+    
+    lang_code = input("Target Language Code (e.g. en, fr, tr) [en]: ").strip().lower() or 'en'
+    
     deck_name = select_deck()
-    print(f"Using deck: {deck_name}")
+    print(f"Using deck: {deck_name} | Language: {lang_code}")
 
     while True:
         try:
@@ -128,13 +148,24 @@ def main():
             word = input("Enter word (or 'q'): ").strip()
             if not word or word.lower() == 'q': break
             
-            print("Fetching English data...")
-            data = parse_trans_data(run_trans_dump(word), word)
-            audio_path, audio_fn = download_audio(word)
+            if card_exists(deck_name, word):
+                print(f"Warning: The word '{word}' is already in the deck '{deck_name}'.")
+                if input("Add anyway? (y/N): ").strip().lower() != 'y':
+                    continue
+
+            print(f"Fetching {lang_code} data...")
+            data = parse_trans_data(run_trans_dump(word, lang_code), word)
+            audio_path, audio_fn = download_audio(word, lang_code)
             
-            subprocess.Popen(["firefox", 
+            target_wiktionary_url = f"https://{lang_code}.wiktionary.org/wiki/{urllib.parse.quote(word)}"
+            en_wiktionary_url = f"https://en.wiktionary.org/wiki/{urllib.parse.quote(word)}"
+            
+            langeek_url = f"https://www.google.com/search?q=site:dictionary.langeek.co+{urllib.parse.quote(word)}"
+            subprocess.Popen(["firefox",
                 f"https://www.google.com/search?tbm=isch&q={urllib.parse.quote(word)}",
-                f"https://en.wiktionary.org/wiki/{urllib.parse.quote(word)}"], 
+                target_wiktionary_url,
+                en_wiktionary_url,
+                langeek_url],
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             
             print("\n--- Card Details ---")
@@ -170,23 +201,65 @@ def main():
             
             if audio_path:
                 with open(audio_path, 'rb') as f:
-                    b64 = subprocess.run(["base64", "-w0"], input=f.read(), capture_output=True).stdout.decode('utf-8').strip()
+                    b64 = base64.b64encode(f.read()).decode('utf-8')
                     invoke('storeMediaFile', filename=audio_fn, data=b64)
                     note["fields"]["Pronunciation sound"] = f"[sound:{audio_fn}]"
             
             if pic_input:
-                if pic_input.startswith("http"):
-                    note["picture"] = [{"url": pic_input, "filename": f"anki_img_{word}.jpg", "fields": ["Picture"]}]
-                else:
-                    if os.path.exists(pic_input):
-                         with open(pic_input, 'rb') as f:
-                            b64 = subprocess.run(["base64", "-w0"], input=f.read(), capture_output=True).stdout.decode('utf-8').strip()
-                            ext = os.path.splitext(pic_input)[1] or ".jpg"
-                            fname = f"anki_img_{int(time.time())}{ext}"
-                            invoke('storeMediaFile', filename=fname, data=b64)
-                            note["fields"]["Picture"] = f'<img src="{fname}">'
-                    else:
-                        print(f"Warning: Image file not found: {pic_input}")
+                img_html_list = []
+                for idx, img_src in enumerate(pic_input.split(',')):
+                    img_src = img_src.strip().strip("'").strip('"')
+                    if not img_src: continue
+                    
+                    # Expand user path (e.g. ~)
+                    img_src = os.path.expanduser(img_src)
+
+                    try:
+                        img_data = None
+                        ext = ".jpg"
+                        
+                        if img_src.startswith("http"):
+                            print(f"Downloading: {img_src}")
+                            try:
+                                r = requests.get(img_src, timeout=15)
+                                if r.status_code == 200:
+                                    img_data = r.content
+                                    ct = r.headers.get("Content-Type", "").lower()
+                                    if "png" in ct: ext = ".png"
+                                    elif "gif" in ct: ext = ".gif"
+                                    elif "webp" in ct: ext = ".webp"
+                                    elif img_src.lower().endswith(".png"): ext = ".png"
+                                    elif img_src.lower().endswith(".gif"): ext = ".gif"
+                                    elif img_src.lower().endswith(".webp"): ext = ".webp"
+                                else:
+                                    print(f"Failed to download {img_src}: {r.status_code}")
+                            except Exception as e:
+                                print(f"Download error {img_src}: {e}")
+                        
+                        elif os.path.exists(img_src):
+                            try:
+                                with open(img_src, 'rb') as f:
+                                    img_data = f.read()
+                                ext = os.path.splitext(img_src)[1] or ".jpg"
+                            except Exception as e:
+                                print(f"File read error {img_src}: {e}")
+                        else:
+                            print(f"Warning: Image not found: {img_src}")
+
+                        if img_data:
+                            # Use unique filename to avoid collisions
+                            fname = f"anki_img_{int(time.time())}_{idx}{ext}"
+                            b64 = base64.b64encode(img_data).decode('utf-8')
+                            if invoke('storeMediaFile', filename=fname, data=b64):
+                                img_html_list.append(f'<img src="{fname}">')
+                            else:
+                                print(f"Failed to store media: {fname}")
+
+                    except Exception as e:
+                        print(f"Error processing {img_src}: {e}")
+                
+                if img_html_list:
+                    note["fields"]["Picture"] = " ".join(img_html_list)
 
             res = invoke('addNote', note=note)
             print(f"Card added! ID: {res}" if res else "Failed to add card.")
